@@ -1,11 +1,15 @@
 
+import base64
 import os
 from datetime import datetime, timezone
+from email.mime.text import MIMEText
 from functools import wraps
 
 from dotenv import load_dotenv
 from flask import Flask, g, jsonify, request
 from flask_cors import CORS
+from google.oauth2.credentials import Credentials
+from googleapiclient.discovery import build
 from supabase import create_client
 
 load_dotenv()
@@ -22,6 +26,49 @@ if not all([SUPABASE_URL, SUPABASE_ANON_KEY, SUPABASE_SERVICE_ROLE_KEY]):
 
 auth_client = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
 db = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+
+
+def send_notification(user_id, subject, body):
+    try:
+        profile = (
+            db.table("profiles")
+            .select("email")
+            .eq("id", user_id)
+            .limit(1)
+            .execute()
+        )
+        if not profile.data or not profile.data[0].get("email"):
+            app.logger.warning("Notification recipient email not found.")
+            return
+
+        credentials = Credentials(
+            token=None,
+            refresh_token=os.getenv("GMAIL_REFRESH_TOKEN"),
+            token_uri="https://oauth2.googleapis.com/token",
+            client_id=os.getenv("GOOGLE_CLIENT_ID"),
+            client_secret=os.getenv("GOOGLE_CLIENT_SECRET"),
+            scopes=["https://www.googleapis.com/auth/gmail.send"],
+        )
+
+        service = build(
+            "gmail",
+            "v1",
+            credentials=credentials,
+            cache_discovery=False,
+        )
+
+        message = MIMEText(body)
+        message["to"] = profile.data[0]["email"]
+        message["subject"] = subject
+        raw_message = base64.urlsafe_b64encode(message.as_bytes()).decode("utf-8")
+
+        service.users().messages().send(
+            userId="me",
+            body={"raw": raw_message},
+        ).execute()
+    except Exception:
+        app.logger.exception("Email notification failed.")
+
 
 VALID_STATUSES = {"pending", "in_progress", "completed"}
 
@@ -108,7 +155,18 @@ def create_task():
             .execute()
         )
 
-        return jsonify(result.data[0]), 201
+        task = result.data[0]
+        if task.get("assigned_to"):
+            send_notification(
+                task["assigned_to"],
+                "New task assigned: " + task["title"],
+                (
+                    f"You have been assigned a new task: {task['title']}\n\n"
+                    f"Description: {task.get('description') or 'No description'}"
+                ),
+            )
+
+        return jsonify(task), 201
 
     except Exception:
         app.logger.exception("Failed to create task")
@@ -215,7 +273,18 @@ def update_task(task_id):
             .execute()
         )
 
-        return jsonify(updated.data[0])
+        updated_task = updated.data[0]
+        if (
+            task["status"] != "completed"
+            and updated_task["status"] == "completed"
+        ):
+            send_notification(
+                task["created_by"],
+                "Task completed: " + updated_task["title"],
+                f'The task "{updated_task["title"]}" has been completed.',
+            )
+
+        return jsonify(updated_task)
 
     except Exception:
         app.logger.exception("Failed to update task")
